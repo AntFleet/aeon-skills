@@ -1,0 +1,39 @@
+{
+  "name": "@antfleet/aeon-skills",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AntFleet skills for Aeon agents — on-demand two-model-consensus PR reviews billed to the install's USDC channel on Base.",
+  "keywords": [
+    "aeon",
+    "antfleet",
+    "base",
+    "code-review",
+    "pr-review",
+    "skill",
+    "x402"
+  ],
+  "homepage": "https://github.com/AntFleet/aeon-skills",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AntFleet/antfleet.git",
+    "directory": "packages/aeon-skills"
+  },
+  "files": [
+    "README.md",
+    "client/**",
+    "pr-review-antfleet/**"
+  ],
+  "type": "module",
+  "main": "./client/antfleet.mjs",
+  "exports": {
+    ".": "./client/antfleet.mjs",
+    "./client/antfleet": "./client/antfleet.mjs"
+  },
+  "dependencies": {
+    "viem": "^2.49.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

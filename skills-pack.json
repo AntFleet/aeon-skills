@@ -1,6 +1,6 @@
 {
   "name": "AntFleet PR Review",
-  "version": "1.0",
+  "version": "2.0",
   "description": "On-demand two-model-consensus PR review billed to the install's USDC channel on Base",
   "author": "AntFleet",
   "license": "MIT",

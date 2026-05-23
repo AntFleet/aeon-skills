@@ -1,18 +1,16 @@
 #!/usr/bin/env node
-// Self-contained AntFleet PR review trigger for Aeon agents.
+// Self-contained AntFleet PR review trigger for Aeon agents (v2.0).
 //
-// Flow (matches docs/aeon-skill-pack.md, three-call protocol):
-//   1. POST {ANTFLEET_API_BASE}/api/v1/installations/{id}/review/challenge
-//      → challenge_id, challenge string, expires_at
-//   2. Sign the challenge string with ANTFLEET_WALLET_PRIVATE_KEY using
-//      EIP-191 personal_sign (viem's signMessage).
-//   3. POST {ANTFLEET_API_BASE}/api/v1/installations/{id}/review with the
-//      signed body → 200 with findings, channel state.
+// Async polling contract:
+//   1. POST .../review/challenge → challenge_id, challenge string
+//   2. Sign the challenge with ANTFLEET_WALLET_PRIVATE_KEY (EIP-191).
+//   3. POST .../review → 202 { jobId, statusUrl }
+//   4. Poll GET .../review/{jobId}?challenge_id=...&signature=...
+//      every 10s until status is complete or failed.
 //
 // On success, writes a clean human-readable markdown report to
-// .outputs/pr-review-antfleet.md so the Aeon agent (and the operator
-// who reads memory/logs) can see the verdict at a glance. Exits 0 on
-// 200 cached or fresh, non-zero on any failure with a clear stderr.
+// .outputs/pr-review-antfleet.md. Exits 0 on complete, non-zero
+// on any failure with a clear stderr.
 //
 // Usage:
 //   node run.mjs --pr 42                       (uses install's bound repo)
@@ -30,8 +28,7 @@
 //
 // Security: ANTFLEET_WALLET_PRIVATE_KEY only authorizes review triggers
 // on this single installation — it cannot move USDC out of the channel,
-// only spend it on reviews. Treat it as a low-blast-radius secret but
-// don't commit it to git. The signature lifetime is bounded to 10 min
+// only spend it on reviews. The signature lifetime is bounded to 10 min
 // per challenge (single-use, server-enforced).
 
 import { mkdir, writeFile } from "node:fs/promises";
@@ -40,9 +37,11 @@ import { privateKeyToAccount } from "viem/accounts";
 
 const DEFAULT_API_BASE = "https://www.antfleet.dev";
 const DEFAULT_OUTPUT_PATH = ".outputs/pr-review-antfleet.md";
+const POLL_INTERVAL_MS = 10_000;
+const POLL_TIMEOUT_MS = 10 * 60 * 1000;
 
 function die(msg, code = 1) {
-  console.error(`pr-review-antfleet: ${msg}`);
+  console.error(`[antfleet] ${msg}`);
   process.exit(code);
 }
 
@@ -63,8 +62,6 @@ function parseArgs(argv) {
   if (out.pr === null && out.sha === null) {
     die("either --pr or --sha is required");
   }
-  // Validate locally before we mint a server-side challenge — bad input
-  // shouldn't burn a nonce just to surface a 400 from the API.
   if (out.pr !== null && !(Number.isInteger(out.pr) && out.pr > 0)) {
     die("--pr must be a positive integer");
   }
@@ -98,9 +95,6 @@ async function mintChallenge(apiBase, installationId) {
   const res = await fetch(url, { method: "POST" });
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    // Return a structured failure so main() can write the error report
-    // file before exiting — the Aeon agent reads that file for its
-    // summary, so we mustn't exit without writing it.
     return { ok: false, status: res.status, body };
   }
   return { ok: true, status: res.status, body };
@@ -114,43 +108,80 @@ async function submitReview(apiBase, installationId, body) {
     body: JSON.stringify(body),
   });
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    // Surface the error code + body verbatim so the Aeon agent can react
-    // (e.g., "402 insufficient_channel_balance" → message the operator).
-    return { ok: false, status: res.status, body: json };
+  return { ok: res.ok, status: res.status, body: json };
+}
+
+async function pollJobStatus(apiBase, installationId, jobId, challengeId, signature) {
+  const base = `${apiBase}/api/v1/installations/${installationId}/review/${jobId}`;
+  const url = `${base}?challenge_id=${encodeURIComponent(challengeId)}&signature=${encodeURIComponent(signature)}`;
+
+  const t0 = Date.now();
+  let elapsed = 0;
+
+  while (elapsed < POLL_TIMEOUT_MS) {
+    const res = await fetch(url);
+    const json = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      return { ok: false, status: res.status, body: json };
+    }
+
+    const status = json.status;
+    elapsed = Date.now() - t0;
+
+    if (status === "complete") {
+      console.error(`[antfleet] complete · ${Math.round(elapsed / 1000)}s elapsed`);
+      return { ok: true, status: res.status, body: json };
+    }
+
+    if (status === "failed") {
+      console.error(`[antfleet] failed · ${json.failureMode ?? "unknown"}`);
+      return { ok: false, status: res.status, body: json, jobFailed: true };
+    }
+
+    if (status === "expired") {
+      console.error(`[antfleet] expired`);
+      return { ok: false, status: res.status, body: json, jobFailed: true };
+    }
+
+    // Still queued or running
+    console.error(`[antfleet] ${status} · ${Math.round(elapsed / 1000)}s elapsed`);
+    await sleep(POLL_INTERVAL_MS);
   }
-  return { ok: true, status: res.status, body: json };
+
+  return { ok: false, status: 0, body: { error: { code: "poll_timeout", message: "polling timed out after 10 minutes" } } };
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function renderFindingsMd({ payload, args, apiBase }) {
-  const r = payload.receipt ?? {};
-  const ch = payload.channel ?? {};
-  const findings = Array.isArray(payload.findings) ? payload.findings : [];
+  const result = payload.result ?? payload;
+  const r = result.receipt ?? result;
+  const findings = Array.isArray(result.findings) ? result.findings : [];
   const lines = [];
   lines.push("# AntFleet PR review");
   lines.push("");
-  const shaForHeader = r.sha ?? args.sha;
+  const shaForHeader = r.commitSha ?? r.sha ?? args.sha;
   const shaCell = shaForHeader ? `\`${String(shaForHeader).slice(0, 12)}\`` : "—";
+  const owner = r.owner ?? r.repo?.owner ?? args.repo ?? "?";
+  const repo = r.repo?.name ?? r.repo ?? "";
+  lines.push(`**Target:** ${owner}/${repo} · PR #${r.prNumber ?? r.pr_number ?? args.pr ?? "?"} · sha ${shaCell}`);
+
+  const cached = result.cached === true;
   lines.push(
-    `**Target:** ${r.repo?.owner ?? args.repo ?? "?"}/${r.repo?.name ?? ""} ` +
-      `· PR #${r.pr_number ?? args.pr ?? "?"} · sha ${shaCell}`,
-  );
-  lines.push(
-    `**Cached:** ${payload.cached ? "yes (no debit)" : "no (fresh review)"} ` +
+    `**Cached:** ${cached ? "yes (no debit)" : "no (fresh review)"} ` +
       `· **Findings:** ${findings.length}`,
   );
-  if (ch.debited_usdc !== undefined && ch.debited_usdc !== null) {
-    lines.push(
-      `**Channel:** debited ${ch.debited_usdc} USDC · remaining ${ch.remaining_usdc ?? "?"} USDC`,
-    );
-  } else {
-    lines.push(`**Channel:** no debit (cached) · remaining ${ch.remaining_usdc ?? "?"} USDC`);
+
+  if (r.prCommentUrl ?? r.pr_comment_url) {
+    lines.push(`**PR comment:** ${r.prCommentUrl ?? r.pr_comment_url}`);
   }
-  if (r.pr_comment_url) {
-    lines.push(`**PR comment:** ${r.pr_comment_url}`);
-  }
-  lines.push(`**Receipt:** ${apiBase}/receipts/${r.review_id ?? ""}`);
+  const reviewId = result.reviewId ?? r.reviewId ?? r.review_id ?? "";
+  lines.push(`**Receipt:** ${apiBase}/receipts/${reviewId}`);
   lines.push("");
+
   if (findings.length === 0) {
     lines.push("---");
     lines.push("");
@@ -213,13 +244,13 @@ function renderFindingsMd({ payload, args, apiBase }) {
 }
 
 function renderErrorMd({ status, body, args, apiBase, installationId, stage = "submit" }) {
-  const code = body?.error?.code ?? "unknown_error";
-  const msg = body?.error?.message ?? "(no message)";
+  const code = body?.error?.code ?? body?.failureMode ?? "unknown_error";
+  const msg = body?.error?.message ?? body?.failureMessage ?? "(no message)";
   const shaCell = args.sha ? `\`${args.sha.slice(0, 12)}\`` : "—";
   const lines = [
     "# AntFleet PR review — failed",
     "",
-    `**Stage:** ${stage === "challenge" ? "challenge mint" : "review submit"}`,
+    `**Stage:** ${stage}`,
     `**Status:** ${status} \`${code}\``,
     `**Message:** ${msg}`,
     `**Install:** ${installationId}`,
@@ -231,6 +262,10 @@ function renderErrorMd({ status, body, args, apiBase, installationId, stage = "s
     lines.push(
       `Top up the channel: send USDC on Base to the deposit address shown in the AntFleet dashboard.`,
       `Required: ${body?.required_usdc ?? "?"} USDC · Current: ${body?.current_usdc ?? "?"} USDC.`,
+    );
+  } else if (code === "sync_mode_removed") {
+    lines.push(
+      `This skill version is outdated. Update to aeon-skills v2.0+ which uses the async polling contract.`,
     );
   } else if (code === "challenge_already_used" || code === "expired_challenge") {
     lines.push(
@@ -251,9 +286,9 @@ function renderErrorMd({ status, body, args, apiBase, installationId, stage = "s
     lines.push(
       `The installation is not eligible for review challenges. This is the deliberately-collapsed code for: row missing, no wallet claimed, or wallet not yet bound. Run the onboarding flow (/api/v1/installations → /bind → fund).`,
     );
-  } else if (code === "review_in_progress") {
+  } else if (code === "poll_timeout") {
     lines.push(
-      `The worker failed transiently and will be retried by the cron sweep. Re-run this skill with a fresh challenge in ~60 seconds — the cached SHA cache means you won't be re-debited; you'll get the cached finding once the sweep completes.`,
+      `The review job did not complete within 10 minutes. It may still finish — check the AntFleet dashboard or re-run with the same PR/SHA (idempotent, no re-debit).`,
     );
   }
   return lines.join("\n");
@@ -270,26 +305,18 @@ async function main() {
   const privateKey = requireEnv("ANTFLEET_WALLET_PRIVATE_KEY");
   const apiBase = (process.env.ANTFLEET_API_BASE ?? DEFAULT_API_BASE).replace(/\/+$/, "");
 
-  // TLS enforcement: refuse plaintext API bases. Signed challenges
-  // posted over http would leak (wallet, install_id, signature) to any
-  // on-path observer. Single-use semantics bound replay but the
-  // disclosure is still a real cost; cheap to reject up front.
   if (!apiBase.startsWith("https://")) {
     die("ANTFLEET_API_BASE must use https:// — refusing to send signed challenges over plaintext");
   }
 
-  // Output-path traversal guard: ANTFLEET_OUTPUT_PATH is operator-set,
-  // but an adversarial sibling skill that can write to the env could
-  // point us at e.g. ~/.ssh/authorized_keys. Resolve against cwd and
-  // reject anything that escapes the project root.
   const cwd = process.cwd();
   const outputPath = resolve(cwd, process.env.ANTFLEET_OUTPUT_PATH ?? DEFAULT_OUTPUT_PATH);
   if (relative(cwd, outputPath).startsWith("..")) {
     die("ANTFLEET_OUTPUT_PATH must resolve within the current working directory");
   }
 
-  // The challenge is server-issued and single-use; we mint a fresh one
-  // every invocation rather than caching one ahead of time.
+  // Step 1: Mint challenge
+  console.error(`[antfleet] minting challenge...`);
   const challengeResult = await mintChallenge(apiBase, installationId);
   if (!challengeResult.ok) {
     const md = renderErrorMd({
@@ -298,15 +325,11 @@ async function main() {
       args,
       apiBase,
       installationId,
-      stage: "challenge",
+      stage: "challenge mint",
     });
     await writeOutput(outputPath, md);
     const code = challengeResult.body?.error?.code ?? "";
-    const msg = challengeResult.body?.error?.message ?? "";
-    console.error(
-      `pr-review-antfleet: challenge mint failed: ${challengeResult.status} ${code} ${msg}`,
-    );
-    console.error(`pr-review-antfleet: wrote error report to ${outputPath}`);
+    console.error(`[antfleet] challenge mint failed: ${challengeResult.status} ${code}`);
     process.exit(2);
   }
   const challenge = challengeResult.body;
@@ -314,13 +337,12 @@ async function main() {
     die(`unexpected challenge response shape: ${JSON.stringify(challenge)}`);
   }
 
-  // EIP-191 personal_sign via viem. The recovered address on the server
-  // side is compared lowercased to the wallet bound at /bind — if this
-  // private key isn't the bound wallet, we get 401 signature_mismatch.
+  // Step 2: Sign
   const pkHex = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
   const account = privateKeyToAccount(pkHex);
   const signature = await account.signMessage({ message: challenge.challenge });
 
+  // Step 3: Submit (POST → 202)
   const body = buildBody({
     challengeId: challenge.challenge_id,
     signature,
@@ -328,6 +350,7 @@ async function main() {
     sha: args.sha,
     repo: args.repo,
   });
+  console.error(`[antfleet] submitting review...`);
   const result = await submitReview(apiBase, installationId, body);
 
   if (!result.ok) {
@@ -337,26 +360,56 @@ async function main() {
       args,
       apiBase,
       installationId,
+      stage: "review submit",
     });
     await writeOutput(outputPath, md);
-    console.error(
-      `pr-review-antfleet: ${result.status} ${result.body?.error?.code ?? ""} ${result.body?.error?.message ?? ""}`,
-    );
-    console.error(`pr-review-antfleet: wrote error report to ${outputPath}`);
-    // 5xx is treated as transient (exit 3, "safe to retry") to match the
-    // SKILL.md / README exit-code contract. 4xx is a permanent caller-
-    // error condition (exit 2, "do NOT retry blindly").
+    console.error(`[antfleet] submit failed: ${result.status} ${result.body?.error?.code ?? ""}`);
     process.exit(result.status >= 500 ? 3 : 2);
   }
 
-  const md = renderFindingsMd({ payload: result.body, args, apiBase });
+  const jobId = result.body?.jobId;
+  if (!jobId) {
+    die(`unexpected submit response — no jobId: ${JSON.stringify(result.body)}`);
+  }
+  console.error(`[antfleet] queued · job ${jobId}`);
+
+  // Step 4: Poll until complete/failed
+  const pollResult = await pollJobStatus(
+    apiBase,
+    installationId,
+    jobId,
+    challenge.challenge_id,
+    signature,
+  );
+
+  if (!pollResult.ok) {
+    const stage = pollResult.jobFailed ? "review processing" : "poll";
+    const md = renderErrorMd({
+      status: pollResult.status,
+      body: pollResult.body,
+      args,
+      apiBase,
+      installationId,
+      stage,
+    });
+    await writeOutput(outputPath, md);
+    const code = pollResult.body?.error?.code ?? pollResult.body?.failureMode ?? "";
+    console.error(`[antfleet] failed: ${code}`);
+    process.exit(pollResult.jobFailed ? 2 : 3);
+  }
+
+  // Complete — render findings from the result
+  const md = renderFindingsMd({ payload: pollResult.body, args, apiBase });
   await writeOutput(outputPath, md);
-  const findingCount = Array.isArray(result.body?.findings) ? result.body.findings.length : 0;
-  const cached = result.body?.cached === true ? " (cached)" : "";
-  console.log(`pr-review-antfleet: ${findingCount} finding(s)${cached} · wrote ${outputPath}`);
+
+  const result2 = pollResult.body.result ?? pollResult.body;
+  const findings = Array.isArray(result2.findings) ? result2.findings : [];
+  const agreedDecision = result2.agreementDecision ?? {};
+  const agreed = Array.isArray(agreedDecision.agreed) ? agreedDecision.agreed : findings;
+  console.log(`[antfleet] ${agreed.length} finding(s) · wrote ${outputPath}`);
 }
 
 main().catch((err) => {
-  console.error("pr-review-antfleet: unexpected error:", err?.stack ?? err);
+  console.error("[antfleet] unexpected error:", err?.stack ?? err);
   process.exit(3);
 });

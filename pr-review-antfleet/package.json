@@ -1,6 +1,6 @@
 {
   "name": "pr-review-antfleet",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "private": true,
   "description": "Aeon skill: trigger an AntFleet two-model-consensus PR review against a specific PR or SHA, write the finding to .outputs/.",
   "type": "module",

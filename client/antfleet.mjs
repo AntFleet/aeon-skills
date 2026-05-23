@@ -1,7 +1,8 @@
-// Shared client module — exposes the three functions the AntFleet
-// on-demand review flow needs, in a form that any non-Aeon consumer
-// (an npm import, a custom GitHub Action, a CLI tool) can reuse
-// without dragging in the SKILL.md / aeon.yml machinery.
+// Shared client module (v2.0) — async polling contract.
+//
+// POST returns 202 + jobId; poll GET until complete/failed.
+// Any non-Aeon consumer (npm import, GitHub Action, CLI tool) can
+// reuse this without the SKILL.md / aeon.yml machinery.
 //
 // Note: Aeon's `./add-skill` ONLY copies the per-skill folder (the one
 // containing SKILL.md) into the user's Aeon project — this top-level
@@ -12,6 +13,8 @@
 import { privateKeyToAccount } from "viem/accounts";
 
 const DEFAULT_API_BASE = "https://www.antfleet.dev";
+const DEFAULT_POLL_INTERVAL_MS = 10_000;
+const DEFAULT_POLL_TIMEOUT_MS = 10 * 60 * 1000;
 
 export class AntfleetReviewError extends Error {
   constructor(message, { status, code, body } = {}) {
@@ -29,11 +32,6 @@ function normalizeBase(apiBase) {
 
 /**
  * Mint a single-use challenge for the given installation.
- *
- * @param {object} args
- * @param {string} args.installationId UUID of the installation row.
- * @param {string} [args.apiBase] override the API base URL.
- * @returns {Promise<{challenge_id: string, challenge: string, installation_id: string, issued_at: string, expires_at: string}>}
  */
 export async function mintChallenge({ installationId, apiBase }) {
   const url = `${normalizeBase(apiBase)}/api/v1/installations/${installationId}/review/challenge`;
@@ -50,14 +48,7 @@ export async function mintChallenge({ installationId, apiBase }) {
 }
 
 /**
- * Sign a challenge string with the bound wallet's private key
- * (EIP-191 personal_sign). The recovered address must match the
- * wallet bound at /bind for the install — server-side check.
- *
- * @param {object} args
- * @param {string} args.privateKey 0x-prefixed 64-hex private key.
- * @param {string} args.challenge the challenge string returned by mintChallenge.
- * @returns {Promise<string>} 0x... 130-hex signature.
+ * Sign a challenge string with the bound wallet's private key (EIP-191).
  */
 export async function signChallenge({ privateKey, challenge }) {
   const pk = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
@@ -66,21 +57,8 @@ export async function signChallenge({ privateKey, challenge }) {
 }
 
 /**
- * Submit the signed review trigger. Returns the parsed response body
- * on success; throws AntfleetReviewError on any 4xx/5xx with code+body
- * attached so callers can branch on error types (e.g. retry on
- * `review_in_progress` 503, top up on `insufficient_channel_balance` 402).
- *
- * @param {object} args
- * @param {string} args.installationId
- * @param {string} args.challengeId
- * @param {string} args.signature
- * @param {number} [args.prNumber]
- * @param {string} [args.sha]
- * @param {string} [args.repo] owner/name override (required only for
- *                             multi-repo installs).
- * @param {string} [args.apiBase]
- * @returns {Promise<object>} the success body (findings, receipt, channel).
+ * Submit the signed review trigger. Returns { jobId, statusUrl }.
+ * POST now returns 202 (async). Use pollJob() to wait for the result.
  */
 export async function submitReview({
   installationId,
@@ -116,15 +94,78 @@ export async function submitReview({
 }
 
 /**
- * Convenience: mint + sign + submit in one call. Returns the
- * submitReview response. Useful for non-Aeon callers who want a
- * one-liner.
+ * Poll a job until it reaches a terminal state (complete or failed).
+ * Returns the final poll response body.
  *
- * Validates inputs locally BEFORE minting the server-side nonce so a
- * caller bug doesn't burn a single-use challenge just to surface a
- * 400 at the submit step.
+ * @param {object} args
+ * @param {string} args.installationId
+ * @param {string} args.jobId
+ * @param {string} args.challengeId   — same challenge used for POST
+ * @param {string} args.signature     — same signature used for POST
+ * @param {string} [args.apiBase]
+ * @param {number} [args.pollIntervalMs]  default 10s
+ * @param {number} [args.pollTimeoutMs]   default 10min
+ * @param {function} [args.onPoll]  callback(status, elapsedMs) on each tick
+ * @returns {Promise<object>}
  */
-export async function triggerReview({ installationId, privateKey, prNumber, sha, repo, apiBase }) {
+export async function pollJob({
+  installationId,
+  jobId,
+  challengeId,
+  signature,
+  apiBase,
+  pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+  pollTimeoutMs = DEFAULT_POLL_TIMEOUT_MS,
+  onPoll,
+}) {
+  const base = `${normalizeBase(apiBase)}/api/v1/installations/${installationId}/review/${jobId}`;
+  const url = `${base}?challenge_id=${encodeURIComponent(challengeId)}&signature=${encodeURIComponent(signature)}`;
+  const t0 = Date.now();
+
+  while (Date.now() - t0 < pollTimeoutMs) {
+    const res = await fetch(url);
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new AntfleetReviewError(json?.error?.message ?? `poll failed: ${res.status}`, {
+        status: res.status,
+        code: json?.error?.code,
+        body: json,
+      });
+    }
+
+    const elapsed = Date.now() - t0;
+    if (onPoll) onPoll(json.status, elapsed);
+
+    if (json.status === "complete") return json;
+    if (json.status === "failed" || json.status === "expired") {
+      throw new AntfleetReviewError(json.failureMessage ?? `job ${json.status}`, {
+        status: res.status,
+        code: json.failureMode ?? json.status,
+        body: json,
+      });
+    }
+
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+
+  throw new AntfleetReviewError("polling timed out", { code: "poll_timeout" });
+}
+
+/**
+ * Convenience: mint + sign + submit + poll in one call.
+ * Returns the completed review result.
+ */
+export async function triggerReview({
+  installationId,
+  privateKey,
+  prNumber,
+  sha,
+  repo,
+  apiBase,
+  pollIntervalMs,
+  pollTimeoutMs,
+  onPoll,
+}) {
   if (prNumber === undefined && sha === undefined) {
     throw new AntfleetReviewError("either prNumber or sha is required");
   }
@@ -139,7 +180,7 @@ export async function triggerReview({ installationId, privateKey, prNumber, sha,
   }
   const challenge = await mintChallenge({ installationId, apiBase });
   const signature = await signChallenge({ privateKey, challenge: challenge.challenge });
-  return submitReview({
+  const submitted = await submitReview({
     installationId,
     challengeId: challenge.challenge_id,
     signature,
@@ -147,5 +188,15 @@ export async function triggerReview({ installationId, privateKey, prNumber, sha,
     sha,
     repo,
     apiBase,
+  });
+  return pollJob({
+    installationId,
+    jobId: submitted.jobId,
+    challengeId: challenge.challenge_id,
+    signature,
+    apiBase,
+    pollIntervalMs,
+    pollTimeoutMs,
+    onPoll,
   });
 }

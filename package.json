@@ -1,6 +1,6 @@
 {
   "name": "@antfleet/aeon-skills",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "private": true,
   "description": "AntFleet skills for Aeon agents — on-demand two-model-consensus PR reviews billed to the install's USDC channel on Base.",
   "keywords": [

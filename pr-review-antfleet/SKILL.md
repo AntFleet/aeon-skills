@@ -10,10 +10,11 @@ tags: [dev, code-review, antfleet, base, x402]
 ## What this skill does
 
 Calls AntFleet's on-demand review endpoint
-(`POST /api/v1/installations/{id}/review`) for the target PR. AntFleet
-runs its two-model consensus (Opus 4.7 + GPT-5) against the PR diff
-and returns the agreed findings inline. The skill writes a
-human-readable report to `.outputs/pr-review-antfleet.md`.
+(`POST /api/v1/installations/{id}/review`) for the target PR. The API
+returns 202 + a job ID immediately; the skill polls
+`GET .../review/{jobId}` every 10 seconds until the two-model consensus
+(Opus 4.7 + GPT-5) completes. Writes a human-readable report to
+`.outputs/pr-review-antfleet.md`.
 
 The same channel that pays for the GitHub App's automatic on-PR-open
 reviews pays for this on-demand trigger — same price (`REVIEW_PRICE_USDC`,
@@ -75,22 +76,27 @@ node run.mjs --pr "$PR_NUMBER" ${REPO:+--repo "$REPO"}
 node run.mjs --sha "$SHA" ${REPO:+--repo "$REPO"}
 ```
 
-The runner does the full three-call protocol:
+The runner does the full four-step async protocol:
 
 1. Mints a fresh single-use challenge from the API.
 2. Signs the challenge string with `ANTFLEET_WALLET_PRIVATE_KEY` using
    EIP-191 personal_sign (via `viem`).
-3. Submits the signed review request and writes the response to
+3. Submits the signed review request → receives 202 + `jobId`.
+4. Polls `GET .../review/{jobId}` every 10s (up to 10 min) until
+   the job reaches `complete` or `failed`, then writes the result to
    `${ANTFLEET_OUTPUT_PATH:-.outputs/pr-review-antfleet.md}`.
+
+Stderr shows live progress: `[antfleet] queued · job <id>`,
+`[antfleet] running · 45s elapsed`, `[antfleet] complete · 3 finding(s)`.
 
 Exit codes:
 
-- `0` — success (review returned 200, finding or no-finding written).
-- `2` — server returned a 4xx (insufficient balance, sig mismatch,
-  closed PR, etc.). Error details are in the output file; do NOT retry
-  blindly — the operator may need to top up or fix the input.
-- `3` — unexpected error (network, signing). Safe to retry once after
-  a short backoff.
+- `0` — success (review completed, finding or no-finding written).
+- `2` — permanent failure (4xx from API, or job failed with a
+  non-retryable error like bad PR number). Error details are in the
+  output file; do NOT retry blindly.
+- `3` — transient error (network, poll timeout, 5xx). Safe to retry
+  once after a short backoff.
 
 After the runner completes, read `.outputs/pr-review-antfleet.md`
 (or `$ANTFLEET_OUTPUT_PATH`) and summarize in `memory/logs/${today}.md`
@@ -107,11 +113,11 @@ severity `critical` or `high`, fire `./notify` with a one-line summary
 
 ## Idempotency
 
-The endpoint caches by `(installation_id, sha)` permanently. Calling
-twice for the same SHA returns the prior finding with `cached: true`
-and does NOT debit again. The skill still consumes a fresh challenge
-nonce each call (single-use anti-replay), so re-running this skill is
-safe and idempotent against the channel.
+The POST endpoint accepts an optional `idempotency_key` parameter. When
+set, re-submitting with the same key returns the existing job without
+creating a new one or debiting again. Even without the key, the same
+(installation, SHA) pair is cached — polling a completed job returns
+`status: "complete"` with the prior finding and no re-debit.
 
 ## Output sample
 

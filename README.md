@@ -166,15 +166,6 @@ The skill folder is self-contained — `run.mjs` imports `viem` from its
 own `node_modules`, makes its own HTTP calls, writes its own output.
 No shared runtime between this skill pack and the broader Aeon project.
 
-### Where this pack lives
-
-We ship it inside the AntFleet monorepo at
-[`packages/aeon-skills/`](https://github.com/antfleet/antfleet/tree/main/packages/aeon-skills)
-during the partnership rollout, then extract to a standalone
-[`AntFleet/aeon-skills`](https://github.com/AntFleet/aeon-skills) repo
-once the surface stabilizes. The layout is identical in both places so
-the extraction is mechanical.
-
 ### For non-Aeon callers
 
 If you want to trigger reviews from a custom script (your own CI,

@@ -1,0 +1,16 @@
+{
+  "name": "AntFleet PR Review",
+  "version": "1.0",
+  "description": "On-demand two-model-consensus PR review billed to the install's USDC channel on Base",
+  "author": "AntFleet",
+  "license": "MIT",
+  "skills": [
+    {
+      "slug": "pr-review-antfleet",
+      "path": "pr-review-antfleet",
+      "description": "Two-model PR review with receipts and per-review drawdown",
+      "category": "review",
+      "default_enabled": false
+    }
+  ]
+}

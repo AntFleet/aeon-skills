@@ -12,6 +12,14 @@ const DEFAULT_API_BASE = "https://www.antfleet.dev";
 const DEFAULT_OUTPUT_PATH = ".outputs/pr-review-antfleet-x402.md";
 const POLL_INTERVAL_MS = 10_000;
 const POLL_TIMEOUT_MS = 10 * 60 * 1000;
+// SPEC-001 v0.6: defer-settle defense — server-side maxTimeoutSeconds
+// is the PRIMARY enforcement of the EIP-3009 validity window.
+//
+// The client-side authorizationWindowSeconds: 600 option is a no-op against
+// @x402/evm@2.13.0 (EvmSchemeConfig accepts only {rpcUrl?}). Future
+// hardening: hand-roll EIP-3009 signing in this runner to set
+// validAfter/validBefore explicitly.
+const MAX_AUTH_WINDOW_SECONDS = 600;
 
 function die(message, code = 1) {
   console.error(`[antfleet:x402] ${message}`);
@@ -22,6 +30,25 @@ function requireEnv(name) {
   const value = process.env[name];
   if (!value) die(`${name} env var is required`, 2);
   return value;
+}
+
+function assertAuthorizationWindowAcceptable(paymentRequirements) {
+  const advertised = Number(paymentRequirements?.maxTimeoutSeconds);
+  if (!Number.isFinite(advertised) || advertised <= 0) {
+    throw new Error(
+      `Refusing to sign authorization: server did not advertise a valid maxTimeoutSeconds (got ${paymentRequirements?.maxTimeoutSeconds}).`,
+    );
+  }
+  if (advertised > MAX_AUTH_WINDOW_SECONDS) {
+    throw new Error(
+      `Refusing to sign authorization: server advertised maxTimeoutSeconds=${advertised}, exceeds client ceiling ${MAX_AUTH_WINDOW_SECONDS}s. Suspected server misconfiguration or version skew.`,
+    );
+  }
+  if (advertised < MAX_AUTH_WINDOW_SECONDS * 0.5) {
+    console.warn(
+      `[x402] Server advertised short window: maxTimeoutSeconds=${advertised}s. Reviews may fail if work exceeds ${advertised}s.`,
+    );
+  }
 }
 
 function parseArgs(argv) {
@@ -64,11 +91,39 @@ function makeClient(privateKey) {
     schemeOptions: {
       [base.id]: {
         rpcUrl: process.env.BASE_RPC_URL ?? "https://mainnet.base.org",
-        authorizationWindowSeconds: 600,
       },
     },
   });
   return new x402HTTPClient(core);
+}
+
+function selectPaymentRequirements(body) {
+  if (!Array.isArray(body?.accepts) || body.accepts.length === 0) {
+    return null;
+  }
+  return (
+    body.accepts.find(
+      (requirements) => requirements?.scheme === "exact" && requirements?.network === "eip155:8453",
+    ) ??
+    body.accepts[0]
+  );
+}
+
+async function assertServerAuthorizationWindow(apiBase, aeonContext, body) {
+  const res = await fetch(`${apiBase}/api/v1/review/x402`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-aeon-context": aeonContext,
+    },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (res.status !== 402) {
+    throw new Error(`Refusing to sign authorization: payment probe returned ${res.status}, expected 402.`);
+  }
+  const paymentRequirements = selectPaymentRequirements(json);
+  assertAuthorizationWindowAcceptable(paymentRequirements);
 }
 
 async function postPaid(httpClient, apiBase, aeonContext, args) {
@@ -76,6 +131,7 @@ async function postPaid(httpClient, apiBase, aeonContext, args) {
   if (args.pr !== null) body.target.pr = args.pr;
   if (args.sha !== null) body.target.sha = args.sha;
 
+  await assertServerAuthorizationWindow(apiBase, aeonContext, body);
   const res = await httpClient.fetch(`${apiBase}/api/v1/review/x402`, {
     method: "POST",
     headers: {

@@ -1,0 +1,19 @@
+{
+  "name": "pr-review-antfleet-x402",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aeon skill: pay-per-call AntFleet PR review via x402 for public repos.",
+  "type": "module",
+  "main": "run.mjs",
+  "scripts": {
+    "review": "node run.mjs"
+  },
+  "dependencies": {
+    "@x402/core": "2.13.0",
+    "@x402/evm": "2.13.0",
+    "viem": "2.49.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

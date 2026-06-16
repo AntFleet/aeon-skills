@@ -1,5 +1,6 @@
 ---
 name: AntFleet PR review (x402)
+category: dev
 description: Pull-mode two-model-consensus PR review via x402. Pay-per-call USDC on Base, no AntFleet installation required. Public repos only. v1 access restricted to aeon-ecosystem callers.
 var: "TARGET"
 tags: [dev, code-review, antfleet, base, x402, public]

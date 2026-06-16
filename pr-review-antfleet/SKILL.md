@@ -1,5 +1,6 @@
 ---
 name: AntFleet PR review
+category: dev
 description: Trigger a real two-model-consensus PR review on a specific PR or SHA via AntFleet, debiting the install's USDC channel on Base. Writes the finding to .outputs/pr-review-antfleet.md.
 var: "TARGET"
 tags: [dev, code-review, antfleet, base, x402]

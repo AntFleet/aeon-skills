@@ -1,6 +1,6 @@
 {
   "name": "AntFleet PR Review",
-  "version": "2.1",
+  "version": "2.2",
   "description": "On-demand two-model-consensus PR review on Base: channel rail for installed repos, x402 pay-per-call for public repos.",
   "author": "AntFleet",
   "license": "MIT",
@@ -9,14 +9,14 @@
       "slug": "pr-review-antfleet",
       "path": "pr-review-antfleet",
       "description": "Two-model PR review with receipts and per-review drawdown",
-      "category": "review",
+      "category": "dev",
       "default_enabled": false
     },
     {
       "slug": "pr-review-antfleet-x402",
       "path": "pr-review-antfleet-x402",
       "description": "Two-model PR review for public repos with x402 pay-per-call USDC",
-      "category": "review",
+      "category": "dev",
       "default_enabled": false
     }
   ]
